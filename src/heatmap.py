@@ -1,67 +1,59 @@
 import folium
 from folium.plugins import HeatMap
-import webbrowser
-import os
+from streamlit_folium import st_folium
+import streamlit as st
+import pandas as pd
 
+def render_heatmap(demand_model, zones, hour, day):
+    st.subheader("🔥 Demand Heatmap")
 
-def generate_heatmap(pred_df, save_path="outputs/maps/heatmap.html"):
-    # ===== Create base map =====
-    m = folium.Map(
-        location=[40.7128, -74.0060],
-        zoom_start=11,
-        tiles="CartoDB positron"
-    )
+    results = []
+    skipped = 0
 
-    # ===== Prepare heatmap data =====
-    heat_data = [
-        [
-            float(row['latitude']),
-            float(row['longitude']),
-            float(row['predicted_demand'])
-        ]
-        for _, row in pred_df.iterrows()
-    ]
+    for zone in zones['LocationID'].unique():
+        row = zones[zones['LocationID'] == zone].iloc[0]
 
-    # ===== Improved Heatmap (sharper + realistic) =====
-    HeatMap(
-        heat_data,
-        radius=20,     # smaller radius → sharper
-        blur=15,       # less blur → clearer hotspots
-        min_opacity=0.3
-    ).add_to(m)
+        # 1. Skip zones with missing coordinates
+        if pd.isna(row['latitude']) or pd.isna(row['longitude']):
+            skipped += 1
+            continue
 
-    # ===== Add dynamic markers =====
-    for _, row in pred_df.iterrows():
-        demand = float(row['predicted_demand'])
+        # 2. Build input
+        input_dict = {
+            'PULocationID': zone,
+            'hour': hour,
+            'day_of_week': day
+        }
 
-        # 🔥 Dynamic radius based on demand
-        radius = max(5, min(12, demand / 50))
+        # 3. Predict demand with specific error handling
+        try:
+            pred = demand_model.predict(pd.DataFrame([input_dict]))[0]
+            pred = max(0, float(pred))  # clamp negative predictions
 
-        # 🎯 Surge color logic
-        color = "red" if row['surge'] else "green"
+            results.append([
+                row['latitude'],
+                row['longitude'],
+                pred
+            ])
 
-        folium.CircleMarker(
-            location=[float(row['latitude']), float(row['longitude'])],
-            radius=radius,
-            color=color,
-            fill=True,
-            fill_opacity=0.85,
-            popup=folium.Popup(
-                f"<b>{row['Zone']}</b><br>"
-                f"Demand: {int(demand)}<br>"
-                f"Surge: {'YES 🔴' if row['surge'] else 'NO 🟢'}",
-                max_width=200
-            )
-        ).add_to(m)
+        except Exception as e:
+            skipped += 1
+            print(f"⚠️  Skipped zone {zone}: {e}")
+            continue
 
-    # ===== Ensure output folder =====
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    # 4. Feedback
+    print(f"✅ Heatmap built: {len(results)} zones plotted, {skipped} skipped")
 
-    # ===== Save map =====
-    m.save(save_path)
-    print(f"✅ Heatmap saved at: {save_path}")
+    if len(results) == 0:
+        st.warning("⚠️ No demand data available to show heatmap.")
+        return
 
-    # ===== Auto open in browser =====
-    webbrowser.open('file://' + os.path.realpath(save_path))
+    # 5. Build map
+    avg_lat = zones['latitude'].mean()
+    avg_lon = zones['longitude'].mean()
 
-    return m
+    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=11)
+    HeatMap(results, radius=15, blur=20, min_opacity=0.4).add_to(m)
+
+    # 6. Render
+    st_folium(m, width=900, height=500)
