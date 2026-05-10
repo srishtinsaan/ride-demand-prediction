@@ -1,3 +1,6 @@
+import os
+IS_CLOUD = os.environ.get("IS_STREAMLIT_CLOUD", "false") == "true"
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,7 +12,6 @@ import matplotlib.pyplot as plt
 
 from src.predict import load_model, predict
 from src.surge import calculate_surge
-from src.feature_engineering import create_features
 
 # ================= CONFIG =================
 st.set_page_config(page_title="🚖 Ride Pricing", layout="wide")
@@ -47,18 +49,18 @@ def load_app_data():
 
 @st.cache_data
 def load_demand_baseline():
-    from src.data_loader import load_data
-    zone_coords = pd.read_csv("data/zone_coords.csv")
-    df, _ = load_data()
-    df = create_features(df, zone_coords)
-    demand_df = df.groupby(
-        ['PULocationID', 'hour', 'day_of_week']
-    ).size().reset_index(name='trip_count')
-    return demand_df, df
+    # ✅ Loads only pre-saved CSV — not full parquet
+    return pd.read_csv("data/demand_baseline.csv")
 
+@st.cache_data
+def load_eval_sample():
+    # ✅ Loads only 10K row sample for evaluation
+    return pd.read_csv("data/eval_sample.csv")
+
+# ✅ Clean single load — no double call, no tuple unpacking
 fare_model, demand_model = load_models()
 zones                    = load_app_data()
-temp_df, df              = load_demand_baseline()
+temp_df                  = load_demand_baseline()
 
 # ================= HAVERSINE =================
 def haversine(lat1, lon1, lat2, lon2):
@@ -95,11 +97,11 @@ with st.form("ride_form"):
         pu_zone    = st.selectbox("📍 Pickup Location", zones['full_name'])
         t1, t2, t3 = st.columns(3)
         with t1:
-            hour_12  = st.selectbox("🕐 Hour", list(range(1, 13)), index=5)
+            hour_12 = st.selectbox("🕐 Hour", list(range(1, 13)), index=5)
         with t2:
-            minute   = st.selectbox("⏱ Minute", [0, 15, 30, 45], index=0)
+            minute  = st.selectbox("⏱ Minute", [0, 15, 30, 45], index=0)
         with t3:
-            am_pm    = st.selectbox("🌅 AM/PM", ["AM", "PM"], index=1)
+            am_pm   = st.selectbox("🌅 AM/PM", ["AM", "PM"], index=1)
         passengers = st.number_input("👤 Passengers", min_value=1, max_value=6, value=1)
 
     with col2:
@@ -239,7 +241,6 @@ if st.session_state.result:
     mid_lat = (r['pu_lat'] + r['do_lat']) / 2
     mid_lon = (r['pu_lon'] + r['do_lon']) / 2
 
-    # Collect predictions for all zones
     all_circle_data = []
     for _, zone_row in zones.iterrows():
         if pd.isna(zone_row['latitude']):
@@ -259,7 +260,6 @@ if st.session_state.result:
         except:
             continue
 
-    # Filter to nearby zones only
     circle_data  = [d for d in all_circle_data if nearby(d['lat'], d['lon'], mid_lat, mid_lon)]
     heatmap_data = [[d['lat'], d['lon'], d['demand']] for d in circle_data]
 
@@ -269,11 +269,9 @@ if st.session_state.result:
         tiles="CartoDB positron"
     )
 
-    # Heatmap base layer
     if heatmap_data:
         HeatMap(heatmap_data, radius=15, blur=20, min_opacity=0.3).add_to(h_map)
 
-    # ✅ Pickup + Drop markers on heatmap
     folium.Marker(
         [r['pu_lat'], r['pu_lon']],
         tooltip=f"📍 Pickup: {r['pu_name']}",
@@ -285,17 +283,12 @@ if st.session_state.result:
         icon=folium.Icon(color='red', icon='stop')
     ).add_to(h_map)
 
-    # ✅ Dotted circles with popup on click
     if circle_data:
-        global_avg  = sum(d['demand'] for d in circle_data) / len(circle_data)
-        max_demand  = max(d['demand'] for d in circle_data)
+        global_avg = sum(d['demand'] for d in circle_data) / len(circle_data)
 
         for d in circle_data:
-            # Red = surge zone, Green = normal
-            is_surge = d['demand'] > (1.5 * global_avg)
-            color    = 'red' if is_surge else 'green'
-
-            # Zone name lookup
+            is_surge  = d['demand'] > (1.5 * global_avg)
+            color     = 'red' if is_surge else 'green'
             zone_info = zones[zones['LocationID'] == d['location_id']]
             zone_name = zone_info['Zone'].iloc[0]    if len(zone_info) > 0 else "Unknown"
             borough   = zone_info['Borough'].iloc[0] if len(zone_info) > 0 else "Unknown"
@@ -323,45 +316,104 @@ if st.session_state.result:
 # ================= MODEL EVALUATION =================
 st.subheader("🧪 Model Evaluation")
 
-if st.button("Run Evaluation"):
-    eval_df = df.dropna(subset=FEATURES + ['total_amount'])
-    eval_df = eval_df[
-        (eval_df['total_amount'] >= 3.0) &
-        (eval_df['total_amount'] <= 200)
-    ]
+if IS_CLOUD:
+    # ✅ On cloud — use pre-saved 10K sample only
+    if st.button("Run Evaluation"):
+        try:
+            eval_df = load_eval_sample()
+        except FileNotFoundError:
+            st.error("❌ eval_sample.csv not found. Run generate_eval_sample.py locally first.")
+            st.stop()
 
-    X      = eval_df[FEATURES]
-    y      = eval_df['total_amount']
-    y_pred = fare_model.predict(X)
+        eval_df = eval_df.dropna(subset=FEATURES + ['total_amount'])
+        eval_df = eval_df[
+            (eval_df['total_amount'] >= 3.0) &
+            (eval_df['total_amount'] <= 200)
+        ]
 
-    mae  = mean_absolute_error(y, y_pred)
-    rmse = np.sqrt(np.mean((y - y_pred) ** 2))
-    r2   = 1 - np.sum((y - y_pred)**2) / np.sum((y - y.mean())**2)
+        X      = eval_df[FEATURES]
+        y      = eval_df['total_amount']
+        y_pred = fare_model.predict(X)
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("MAE",  f"${mae:.2f}")
-    m2.metric("RMSE", f"${rmse:.2f}")
-    m3.metric("R²",   f"{r2:.4f}")
+        mae  = mean_absolute_error(y, y_pred)
+        rmse = np.sqrt(np.mean((y - y_pred) ** 2))
+        r2   = 1 - np.sum((y - y_pred)**2) / np.sum((y - y.mean())**2)
 
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.scatter(y, y_pred, alpha=0.3, s=10, color='steelblue')
-    ax.plot([3, 200], [3, 200], 'r--', linewidth=1.5, label='Perfect Prediction')
-    ax.set_xlim(0, 200)
-    ax.set_ylim(0, 200)
-    ax.set_xlabel("Actual Total ($)")
-    ax.set_ylabel("Predicted Total ($)")
-    ax.set_title("Model Accuracy — Actual vs Predicted")
-    ax.legend()
-    st.pyplot(fig)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("MAE",  f"${mae:.2f}")
+        m2.metric("RMSE", f"${rmse:.2f}")
+        m3.metric("R²",   f"{r2:.4f}")
 
-    st.subheader("🔍 Sample Predictions")
-    sample  = eval_df.sample(10)
-    samples = []
-    for _, row in sample.iterrows():
-        pred = predict(fare_model, row[FEATURES].to_dict())
-        samples.append({
-            "Actual Total" : f"${row['total_amount']:.2f}",
-            "Predicted"    : f"${pred:.2f}",
-            "Difference"   : f"${abs(row['total_amount'] - pred):.2f}"
-        })
-    st.dataframe(pd.DataFrame(samples))
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.scatter(y, y_pred, alpha=0.3, s=10, color='steelblue')
+        ax.plot([3, 200], [3, 200], 'r--', linewidth=1.5, label='Perfect Prediction')
+        ax.set_xlim(0, 200)
+        ax.set_ylim(0, 200)
+        ax.set_xlabel("Actual Total ($)")
+        ax.set_ylabel("Predicted Total ($)")
+        ax.set_title("Model Accuracy — Actual vs Predicted")
+        ax.legend()
+        st.pyplot(fig)
+
+        st.subheader("🔍 Sample Predictions")
+        sample  = eval_df.sample(min(10, len(eval_df)))
+        samples = []
+        for _, row in sample.iterrows():
+            pred = predict(fare_model, row[FEATURES].to_dict())
+            samples.append({
+                "Actual Total" : f"${row['total_amount']:.2f}",
+                "Predicted"    : f"${pred:.2f}",
+                "Difference"   : f"${abs(row['total_amount'] - pred):.2f}"
+            })
+        st.dataframe(pd.DataFrame(samples))
+
+else:
+    # ✅ Local — same evaluation block, no restrictions
+    if st.button("Run Evaluation"):
+        try:
+            eval_df = load_eval_sample()
+        except FileNotFoundError:
+            st.error("❌ eval_sample.csv not found. Run generate_eval_sample.py first.")
+            st.stop()
+
+        eval_df = eval_df.dropna(subset=FEATURES + ['total_amount'])
+        eval_df = eval_df[
+            (eval_df['total_amount'] >= 3.0) &
+            (eval_df['total_amount'] <= 200)
+        ]
+
+        X      = eval_df[FEATURES]
+        y      = eval_df['total_amount']
+        y_pred = fare_model.predict(X)
+
+        mae  = mean_absolute_error(y, y_pred)
+        rmse = np.sqrt(np.mean((y - y_pred) ** 2))
+        r2   = 1 - np.sum((y - y_pred)**2) / np.sum((y - y.mean())**2)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("MAE",  f"${mae:.2f}")
+        m2.metric("RMSE", f"${rmse:.2f}")
+        m3.metric("R²",   f"{r2:.4f}")
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.scatter(y, y_pred, alpha=0.3, s=10, color='steelblue')
+        ax.plot([3, 200], [3, 200], 'r--', linewidth=1.5, label='Perfect Prediction')
+        ax.set_xlim(0, 200)
+        ax.set_ylim(0, 200)
+        ax.set_xlabel("Actual Total ($)")
+        ax.set_ylabel("Predicted Total ($)")
+        ax.set_title("Model Accuracy — Actual vs Predicted")
+        ax.legend()
+        st.pyplot(fig)
+
+        st.subheader("🔍 Sample Predictions")
+        sample  = eval_df.sample(min(10, len(eval_df)))
+        samples = []
+        for _, row in sample.iterrows():
+            pred = predict(fare_model, row[FEATURES].to_dict())
+            samples.append({
+                "Actual Total" : f"${row['total_amount']:.2f}",
+                "Predicted"    : f"${pred:.2f}",
+                "Difference"   : f"${abs(row['total_amount'] - pred):.2f}"
+            })
+        st.dataframe(pd.DataFrame(samples))
